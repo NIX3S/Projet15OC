@@ -1,0 +1,191 @@
+version: "3.9"
+
+# ── RAG Juridique DREETS-IA — Docker Compose (sans Airflow) ──────────────────
+# Services :
+#   1. cron      — Tâches périodiques (indexation, bootstrap)
+#   2. api       — FastAPI RAG service
+#   3. dashboard — Streamlit (Dashboard + Chat)
+#   4. mistral   — Ollama Mistral qwen3:1.7b (LLM local)
+
+networks:
+  rag_net:
+    driver: bridge
+
+volumes:
+  rag_data:
+    driver: local
+  ollama_models:
+    driver: local
+  cron_logs:
+    driver: local
+
+x-common-env: &common-env
+  RAG_DATA_DIR: /data
+  RAG_API_BASE: http://api:8000
+  LEGIFRANCE_CLIENT_ID: ${LEGIFRANCE_CLIENT_ID:-}
+  LEGIFRANCE_CLIENT_SECRET: ${LEGIFRANCE_CLIENT_SECRET:-}
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+  MISTRAL_API_URL: http://mistral:11434/api/generate
+  MISTRAL_MODEL: qwen3:1.7b
+  TZ: Europe/Paris
+
+services:
+  # ── Ollama Mistral qwen3:1.7b (LLM) ─────────────────────────────────────────────
+  mistral:
+    image: ollama/ollama:latest
+    container_name: rag_mistral
+    restart: unless-stopped
+    networks:
+      - rag_net
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+    # Télécharge Mistral qwen3:1.7b au premier démarrage
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull qwen3:1.7b && wait"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+  # ── FastAPI RAG ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY api/ ./api/
+        ENV PYTHONUNBUFFERED=1
+        EXPOSE 8000
+        CMD ["python", "-m", "uvicorn", "api.rag_legal_api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    container_name: rag_api
+    restart: unless-stopped
+    networks:
+      - rag_net
+    ports:
+      - "8000:8000"
+    volumes:
+      - rag_data:/data:ro
+    environment:
+      <<: *common-env
+
+
+
+  # ── Streamlit Dashboard ────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY dashboard/ ./dashboard/
+        COPY eval/ ./eval/
+        ENV PYTHONUNBUFFERED=1
+        EXPOSE 8501 8502
+        CMD ["sh", "-c", "streamlit run dashboard/streamlit_monitoring.py --server.port=8501 --server.address=0.0.0.0 & streamlit run dashboard/streamlit_chat_interface.py --server.port=8502 --server.address=0.0.0.0 && wait"]
+    container_name: rag_dashboard
+    restart: unless-stopped
+    networks:
+      - rag_net
+    ports:
+      - "8501:8501"  # Dashboard métriques
+      - "8502:8502"  # Chat conversationnel
+    volumes:
+      - rag_data:/data:ro
+      - ./eval/results:/app/eval/results
+    environment:
+      <<: *common-env
+
+
+  # ── Cron Job Manager (remplace Airflow) ────────────────────────────────────
+  # Service cron corrigé (utilise legal_codes_daily.py à la racine)
+  cron:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y cron curl && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        # ✅ Fichiers à la racine
+        COPY legal_codes_daily.py .
+        COPY data/ ./data/
+        COPY eval/ ./eval/
+        # Crontab : indexation quotidienne + éval
+        RUN echo "0 2 * * * cd /app && python legal_codes_daily.py >> /var/log/cron.log 2>&1" > /etc/cron.d/rag-update \
+        && echo "30 2 * * * cd /app && python eval/evaluation_rag.py >> /var/log/cron.log 2>&1" >> /etc/cron.d/rag-update \
+        && chmod 0644 /etc/cron.d/rag-update \
+        && crontab /etc/cron.d/rag-update
+        # Crée le fichier de log avant de démarrer cron
+        RUN mkdir -p /var/log && touch /var/log/cron.log
+        CMD cron && tail -f /var/log/cron.log
+
+    container_name: rag_cron
+    restart: unless-stopped
+    networks:
+      - rag_net
+    volumes:
+      - rag_data:/data
+      - cron_logs:/var/log/cron
+    environment:
+      <<: *common-env
+
+
+  # ── Bootstrap (job one-shot) ──────────────────────────────────────────────
+  bootstrap:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y curl build-essential && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY data/ ./data/
+    container_name: rag_bootstrap
+    networks:
+      - rag_net
+    volumes:
+      - rag_data:/data
+    environment:
+      <<: *common-env
+      command: sh -c " echo '$$(date)' > /data/bootstrap.done && python data/bootstrap.py --codes travail securite civil proc_civile --test && echo 'OK $$(date)' >> /data/bootstrap.done"
+    profiles:
+      - bootstrap
+
+  # ── Évaluation one-shot ────────────────────────────────────────────────────
+  eval:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY eval/ ./eval/
+    container_name: rag_eval
+    networks:
+      - rag_net
+    volumes:
+      - rag_data:/data:ro
+      - ./eval/results:/app/eval/results
+    environment:
+      <<: *common-env
+    command: python eval/evaluation_rag.py
+    profiles:
+      - eval
