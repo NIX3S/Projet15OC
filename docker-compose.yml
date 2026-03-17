@@ -121,7 +121,6 @@ services:
         RUN apt-get update && apt-get install -y cron curl && rm -rf /var/lib/apt/lists/*
         COPY requirements.txt .
         RUN pip install --no-cache-dir -r requirements.txt
-        # ✅ Fichiers à la racine
         COPY legal_codes_daily.py .
         COPY data/ ./data/
         COPY eval/ ./eval/
