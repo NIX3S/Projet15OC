@@ -29,8 +29,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 DATA_DIR    = Path(os.getenv("RAG_DATA_DIR", Path.cwd() / "data")).resolve()
 print(DATA_DIR)
 MODEL_NAME  = "dangvantuan/sentence-camembert-base"
-MISTRAL_URL = os.getenv("MISTRAL_API_URL", "http://localhost:11434/api/generate")
+MISTRAL_URL = os.getenv("MISTRAL_API_URL", "http://mistral:11434/api/generate")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "qwen3:1.7b")
+print(MISTRAL_URL)
+print(MISTRAL_MODEL)
 MAX_HISTORY = 10  # messages conservés dans la context window
 #MISTRAL_MODEL = "mistral-nemo:latest"  # 2B → 1-2s vs 30s mistral-nemo
 
@@ -300,8 +302,8 @@ async def _call_mistral(prompt: str, raw_chunks: List[Dict]) -> str:
     
     # TEST RAPIDE : tags (200ms)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, read=40.0)) as client:
-            tags = await client.get("http://localhost:11434/api/tags")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, read=120.0)) as client:
+            tags = await client.get("http://mistral:11434/api/tags")
             models = tags.json().get("models", [])
             log.info("Ollama: %d modèles: %s", len(models), [m["name"] for m in models[:3]])
             
@@ -319,7 +321,7 @@ async def _call_mistral(prompt: str, raw_chunks: List[Dict]) -> str:
     log.info("Prompt %d chars → %s", len(short_prompt), MISTRAL_MODEL)
     
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, read=40.0)) as client:  # 12s MAX
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, read=120.0)) as client:  # 12s MAX
             resp = await client.post(MISTRAL_URL, json={
                 "model": MISTRAL_MODEL,
                 "prompt": short_prompt,
